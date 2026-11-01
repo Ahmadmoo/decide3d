@@ -11,7 +11,7 @@ from .evaluate import evaluate, metrics
 cfg, stage = yaml.safe_load(open(sys.argv[1])), sys.argv[2]
 st, dc, oc = cfg["stages"][stage], cfg["data"], cfg["optim"]
 ddp = "LOCAL_RANK" in os.environ
-if ddp: dist.init_process_group("nccl", timeout=datetime.timedelta(minutes=30))  # rank 0 evaluates and saves alone
+if ddp: dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo", timeout=datetime.timedelta(minutes=30))  # rank 0 evaluates and saves alone
 rank, world = (dist.get_rank(), dist.get_world_size()) if ddp else (0, 1)
 dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0))) if torch.cuda.is_available() else torch.device("cpu")
 if dev.type == "cuda": torch.cuda.set_device(dev)
@@ -32,7 +32,7 @@ net.base.model.language_model.gradient_checkpointing_enable()
 groups = {}
 for name, p in net.named_parameters():
     if p.requires_grad:
-        key = ("lr_llm" if name.startswith("base.") else "lr_new", p.ndim >= 2 and "embed" not in name and ".type." not in name)
+        key = ("lr_llm" if name.startswith("base.") else "lr_new", p.ndim >= 2 and "embed" not in name and ".kind." not in name)
         groups.setdefault(key, []).append(p)
 params = [p for ps in groups.values() for p in ps]
 opt = torch.optim.AdamW([dict(params=ps, peak=st[k], weight_decay=oc["weight_decay"] * decay) for (k, decay), ps in groups.items()],
@@ -47,7 +47,7 @@ if (out / "last.pt").exists():
     net.load_state_dict(ck["model"], strict=False)
     opt.load_state_dict(ck["opt"])
     step = ck["step"]
-model = torch.nn.parallel.DistributedDataParallel(net, device_ids=[dev.index], broadcast_buffers=False) if ddp else net
+model = torch.nn.parallel.DistributedDataParallel(net, device_ids=[dev.index] if dev.type == "cuda" else None) if ddp else net
 
 
 def batches(m):

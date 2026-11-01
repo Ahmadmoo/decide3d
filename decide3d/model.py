@@ -5,7 +5,9 @@ from transformers.integrations.flex_attention import flex_attention_forward
 from .data import TYPES
 
 
-def _flex(module, q, k, v, mask, **kw):  # under autocast q, k leave the fp32 RMSNorms as fp32 while v is bf16
+def _flex(module, q, k, v, mask, **kw):
+    """HF flex attention under our own name (Qwen3-VL does not declare flex support).
+    Under autocast q, k leave the fp32 RMSNorms as fp32 while v is bf16; older torch has no autocast rule for flex."""
     return flex_attention_forward(module, q.to(v.dtype), k.to(v.dtype), v, mask, **kw)
 
 
@@ -34,14 +36,14 @@ class SetHead(nn.Module):
     def __init__(self, d, w, layers, heads=8):
         super().__init__()
         self.opt, self.ctx = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, w)), nn.Sequential(nn.LayerNorm(d), nn.Linear(d, w))
-        self.score, self.type = nn.Linear(1, w), nn.Embedding(len(TYPES), w)
+        self.score, self.kind = nn.Linear(1, w), nn.Embedding(len(TYPES), w)
         self.blocks = nn.ModuleList(nn.TransformerEncoderLayer(w, heads, 4 * w, 0.0, "gelu", batch_first=True, norm_first=True) for _ in range(layers))
         self.out = nn.Linear(w, 1)
         nn.init.zeros_(self.out.weight)
         nn.init.zeros_(self.out.bias)
 
     def forward(self, ho, hq, s, qtype, ok):
-        x = self.opt(ho) + self.score(s[..., None]) + (self.ctx(hq) + self.type(qtype))[:, None]
+        x = self.opt(ho) + self.score(s[..., None]) + (self.ctx(hq) + self.kind(qtype))[:, None]
         for blk in self.blocks: x = blk(x, src_key_padding_mask=~ok)
         return self.out(x)[..., 0]
 

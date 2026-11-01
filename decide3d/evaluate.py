@@ -76,7 +76,7 @@ def metrics(r, temp=(1.0, 1.0, 1.0)):
 
 
 def fit_temperature(r):
-    grid = np.exp(np.linspace(math.log(0.25), math.log(4.0), 161))
+    grid = np.exp(np.linspace(math.log(0.05), math.log(20.0), 241))
     T = []
     for ty in TYPES.values():
         s = r["qtype"] == ty

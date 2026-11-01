@@ -50,7 +50,7 @@ pytest -q
 | Part | State |
 |---|---|
 | Data pipeline | done, tested on fake data; real CA-VQA wording still to check (`--peek`, `--templates`) |
-| Model, training, evaluation | done, tested on a tiny random Qwen3-VL on CPU |
+| Model, training, evaluation | done, tested on CPU with a tiny random Qwen3-VL (torch 2.15, transformers 5.22): one pass = separate runs, order invariance, flex = dense mask, DDP with 2 processes |
 | Full run on H100 | not run yet |
 | Thor inference (KV cache, batched options) | planned |
 

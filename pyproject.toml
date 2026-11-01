@@ -3,7 +3,7 @@ name = "decide3d"
 version = "0.1.0"
 description = "RGB-only 3D decision model: calibrated, order-invariant answers to 3D queries"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.6", "transformers>=4.57", "numpy", "pillow", "pyyaml"]
+dependencies = ["torch>=2.6", "transformers>=5.22", "numpy", "pillow", "pyyaml"]
 
 [project.optional-dependencies]
 preprocess = ["datasets", "tensorflow-cpu", "tensorflow-datasets", "importlib_resources", "moge @ git+https://github.com/microsoft/MoGe.git"]
