@@ -1,0 +1,20 @@
+[project]
+name = "decide3d"
+version = "0.1.0"
+description = "RGB-only 3D decision model: calibrated, order-invariant answers to 3D queries"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.6", "transformers>=4.57", "numpy", "pillow", "pyyaml"]
+
+[project.optional-dependencies]
+preprocess = ["datasets", "tensorflow-cpu", "tensorflow-datasets", "importlib_resources", "moge @ git+https://github.com/microsoft/MoGe.git"]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["decide3d"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

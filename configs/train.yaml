@@ -1,0 +1,46 @@
+model: Qwen/Qwen3-VL-2B-Instruct
+frames_dir: /scratch/cavqa_frames
+geom_dir: /scratch/cavqa_geom
+out_dir: runs/main
+attn: flex                    # flex: block mask, packed frames (training); sdpa: dense mask (tests, small eval)
+
+data:
+  max_questions: 32           # per frame per visit; eval splits a frame into chunks of this size
+  frames_per_micro: 2         # frames packed into one sequence per GPU
+  train_pixels: [250000, 500000, 800000]
+  eval_pixels: 300000         # Thor setting
+  invert_prob: 0.5            # closer <-> farther, left <-> right, ... with flipped label (yes/no and 2-option only)
+  geo_drop: 0.15              # whole frame without geometry
+  mask_prob: 0.3              # appearance masking: frames affected
+  mask_ratio: [0.3, 0.6]      # fraction of visual tokens replaced by a learned mask token (geometry kept)
+  workers: 8
+  paraphrase:                 # regex -> rewrites; extend after `build_frames.py --templates`
+    '\bcloser to\b': [nearer to]
+    '\bfarther from\b': [further from]
+    '\bin the image\b': [in this image, in the picture]
+    '\bin meters\b': [in metres, in m]
+
+net:
+  geo_hidden: 512
+  set_dim: 512
+  set_layers: 2
+
+loss:
+  rps_weight: 0.5             # ordinal penalty for score questions (counts, metric bins)
+  task_power: -0.5            # task weight ~ (questions in task) ^ power
+
+optim:
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+  grad_clip: 1.0
+  warmup: 0.03                # WSD schedule: warmup, flat, linear decay over the last `decay` fraction
+  decay: 0.2
+
+batch_frames: 64              # global frames per optimizer step
+eval_every: 500
+eval_questions: 5000          # dev questions used for periodic eval
+save_every: 1000
+
+stages:
+  A: {steps: 1000, lr_llm: 0.0, lr_new: 2.0e-4}
+  B: {epochs: 3, lr_llm: 1.0e-5, lr_new: 1.0e-4, init: runs/main/A/last.pt}
