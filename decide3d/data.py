@@ -11,13 +11,15 @@ TASKS = {"binary": 0, "multichoice": 1, "regression": 2, "cardinality": 3}
 SUBSETS = [None, "dev", "test"]
 PX = 32  # pixels per visual token: 16 px patches, 2x2 merge
 
-INVERSE = {"left": "right", "right": "left", "in front of": "behind", "behind": "in front of",
+INVERSE = {"to the left of": "to the right of", "to the right of": "to the left of", "infront of": "behind of", "behind of": "infront of",
            "closer to": "farther from", "farther from": "closer to", "further from": "closer to", "nearer to": "farther from",
            "closest": "farthest", "farthest": "closest", "nearest": "farthest",
+           "higher than": "lower than", "lower than": "higher than",
            "larger": "smaller", "bigger": "smaller", "smaller": "larger", "largest": "smallest", "biggest": "smallest", "smallest": "largest",
            "taller": "shorter", "shorter": "taller", "tallest": "shortest", "shortest": "tallest",
            "wider": "narrower", "narrower": "wider", "widest": "narrowest", "narrowest": "widest"}
-INVERSE_RE = re.compile(r"\b(" + "|".join(sorted(map(re.escape, INVERSE), key=len, reverse=True)) + r")\b", re.I)
+BLOCK = ["left", "right", "in front of", "behind", "longer than"]  # no safe inverse, or part of an object name: leave the question alone
+INVERSE_RE = re.compile(r"\b(" + "|".join(sorted(map(re.escape, [*INVERSE, *BLOCK]), key=len, reverse=True)) + r")\b", re.I)
 
 
 class Tok:
@@ -78,7 +80,7 @@ def fit_size(w0, h0, pixels):
 def invert(q):
     """'closer' <-> 'farther' etc. with the label flipped; only for yes/no and 2-option questions with exactly one such word."""
     m = INVERSE_RE.findall(q["question"])
-    if len(m) != 1 or len(q["options"]) != 2 or q["type"] == "score": return q
+    if len(m) != 1 or len(q["options"]) != 2 or q["type"] == "score" or m[0].lower() not in INVERSE: return q
     w = m[0]
     inv = INVERSE[w.lower()]
     text = INVERSE_RE.sub(inv[0].upper() + inv[1:] if w[0].isupper() else inv, q["question"], count=1)
@@ -97,8 +99,17 @@ def shuffle(q):
     return dict(q, options=[q["options"][k] for k in p], target=[q["target"][k] for k in p], perm=p)
 
 
+def sample(qs, n):
+    """One visit of a frame: n random questions, shared evenly over its tasks (a frame has thousands, mostly multichoice)."""
+    by = {}
+    for q in qs: by.setdefault(q["task"], []).append(q)
+    for v in by.values(): random.shuffle(v)
+    return [v[i] for i in range(n) for v in by.values() if i < len(v)][:n]
+
+
 class Frames(torch.utils.data.Dataset):
-    """One item = one frame with up to `max_questions` of its questions; a frame with more questions gives several items.
+    """Train: one item = one visit of a frame with `max_questions` sampled questions, so an epoch is one pass over the images.
+    Eval: every question once; a frame with more than `max_questions` gives several items.
     Questions never see each other (segment mask), so how they are grouped does not change any answer."""
 
     def __init__(self, cfg, split, tok, train, subset=None, shuffle_options=False):
@@ -108,7 +119,7 @@ class Frames(torch.utils.data.Dataset):
         self.shards = [root / n for n in (root / f"{split}_shards.txt").read_text().split()]
         index = np.load(root / f"{split}_index.npy")
         index = index[index[:, 3] == SUBSETS.index(subset)] if subset else index
-        k = -(-index[:, 2] // self.c["max_questions"])
+        k = np.ones_like(index[:, 2]) if train else -(-index[:, 2] // self.c["max_questions"])
         start = np.arange(k.sum()) - np.repeat(np.cumsum(k) - k, k)
         self.items = np.column_stack([np.repeat(index[:, :2], k, 0), start * self.c["max_questions"]])
 
@@ -121,7 +132,7 @@ class Frames(torch.utils.data.Dataset):
             f.seek(off)
             fr = json.loads(f.readline())
         c = self.c
-        qs = fr["questions"][j:j + c["max_questions"]]
+        qs = fr["questions"][j:j + c["max_questions"]] if not self.train else sample(fr["questions"], c["max_questions"])
         if self.train: qs = [paraphrase(invert(q) if random.random() < c["invert_prob"] else q, self.rules) for q in qs]
         if self.shuffle_options: qs = [shuffle(q) for q in qs]
         img = Image.open(fr["image"]).convert("RGB")

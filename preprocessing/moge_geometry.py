@@ -1,15 +1,17 @@
-import sys, json, pathlib, math
+import os, sys, pathlib
+from multiprocessing.pool import ThreadPool
 import numpy as np, torch
 from PIL import Image
 
 # Runs frozen MoGe-2 on every frame image once and stores small geometry grids for the model.
 #   pip install git+https://github.com/microsoft/MoGe.git
-#   python preprocessing/moge_geometry.py <frames_dir> <geom_dir> [--split=train,val] [--part=i/n] [--num-tokens=1200] [--batch=16]
+#   python preprocessing/moge_geometry.py <frames_dir> <geom_dir> [--split=train,val] [--part=i/n] [--num-tokens=1200] [--batch=16] [--threads=8] [--limit=N]
 # Per frame: <geom_dir>/<fid[:2]>/<fid>.npz with
 #   grid  (6, H/16, W/16) fp16: log-depth (median of valid), normal xyz (mean), valid fraction, depth spread (IQR / median)
 #   scene (6,) fp32: log-depth p5, p50, p95, valid fraction, fov_x, fov_y (radians)
 #   K     (3, 3) fp32: MoGe intrinsics, normalized by image width / height
 # Keep --num-tokens equal to what the robot will run, so the model learns how reliable MoGe is at that setting.
+# Stopped runs continue: finished frames are skipped.
 
 CELL = 16
 
@@ -42,16 +44,17 @@ def pool(depth, normal, mask):
 def frames(frames_dir, splits, ip, n_parts):
     i = 0
     for sp in splits:
-        for name in (frames_dir / f"{sp}_shards.txt").read_text().split():
-            for line in open(frames_dir / name):
-                if i % n_parts == ip:
-                    fr = json.loads(line)
-                    yield fr["fid"], fr["image"]
-                i += 1
+        for line in open(frames_dir / f"{sp}_images.txt"):
+            if i % n_parts == ip: yield line.rstrip("\n").split("\t")
+            i += 1
 
 
-def run(batch, model, out, num_tokens):
-    imgs = torch.stack([torch.from_numpy(np.asarray(Image.open(p).convert("RGB"))).permute(2, 0, 1) for _, p in batch]).cuda().float() / 255
+def decode(path):
+    return torch.from_numpy(np.array(Image.open(path).convert("RGB"))).permute(2, 0, 1)
+
+
+def run(batch, model, out, num_tokens, threads):
+    imgs = torch.stack(threads.map(decode, [p for _, p in batch])).cuda().float() / 255
     with torch.no_grad():
         o = model.infer(imgs, num_tokens=num_tokens)
     for b, (fid, _) in enumerate(batch):
@@ -60,7 +63,9 @@ def run(batch, model, out, num_tokens):
         fov = 2 * torch.atan(0.5 / K[[0, 1], [0, 1]])
         path = out / fid[:2] / f"{fid}.npz"
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(path, grid=grid.half().cpu().numpy(), scene=torch.cat([scene, fov]).cpu().numpy().astype(np.float32), K=K.cpu().numpy())
+        tmp = path.with_suffix(f".tmp{os.getpid()}.npz")
+        np.savez(tmp, grid=grid.half().cpu().numpy(), scene=torch.cat([scene, fov]).cpu().numpy().astype(np.float32), K=K.cpu().numpy())
+        os.replace(tmp, path)
 
 
 if __name__ == "__main__":
@@ -69,14 +74,18 @@ if __name__ == "__main__":
     frames_dir, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
     ip, n_parts = map(int, args.get("part", "0/1").split("/"))
     num_tokens, bs = int(args.get("num-tokens", 1200)), int(args.get("batch", 16))
+    limit = int(args.get("limit", 0))
     model = MoGeModel.from_pretrained(args.get("model", "Ruicheng/moge-2-vits-normal")).cuda().eval()
-    batch, size, done = [], None, 0
+    threads = ThreadPool(int(args.get("threads", 8)))
+    waiting, done = {}, 0  # landscape and portrait frames batch separately
     for fid, image in frames(frames_dir, args.get("split", "train,val").split(","), ip, n_parts):
         if (out / fid[:2] / f"{fid}.npz").exists(): continue
-        s = Image.open(image).size
-        if batch and (s != size or len(batch) == bs):
-            run(batch, model, out, num_tokens); done += len(batch); batch = []
-        batch.append((fid, image)); size = s
-        if done and done % 5000 < bs: print(f"{done} frames", flush=True)
-    if batch: run(batch, model, out, num_tokens); done += len(batch)
+        batch = waiting.setdefault(Image.open(image).size, [])
+        batch.append((fid, image))
+        if len(batch) == bs:
+            run(batch, model, out, num_tokens, threads); done += bs; batch.clear()
+            if done % 5000 < bs: print(f"{done} frames", flush=True)
+            if limit and done >= limit: break
+    for batch in waiting.values():
+        if batch: run(batch, model, out, num_tokens, threads); done += len(batch)
     print(f"done: {done} frames written to {out}")

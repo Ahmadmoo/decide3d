@@ -1,11 +1,11 @@
 model: Qwen/Qwen3-VL-2B-Instruct
-frames_dir: /scratch/cavqa_frames
-geom_dir: /scratch/cavqa_geom
-out_dir: runs/main
+frames_dir: /projects/beqw/ahmadmoo/cavqa/frames
+geom_dir: /projects/beqw/ahmadmoo/cavqa/geom
+out_dir: /projects/beqw/ahmadmoo/decide3d_runs/main
 attn: flex                    # flex: block mask, packed frames (training); sdpa: dense mask (tests, small eval)
 
 data:
-  max_questions: 32           # per frame per visit; eval splits a frame into chunks of this size
+  max_questions: 32           # train: sampled per frame visit, even over tasks; eval: every question, in chunks of this size
   frames_per_micro: 2         # frames packed into one sequence per GPU
   train_pixels: [250000, 500000, 800000]
   eval_pixels: 300000         # Thor setting
@@ -18,7 +18,12 @@ data:
     '\bcloser to\b': [nearer to]
     '\bfarther from\b': [further from]
     '\bin the image\b': [in this image, in the picture]
-    '\bin meters\b': [in metres, in m]
+    '\binfront of\b': [in front of]
+    '\bbehind of\b': [behind]
+    '\bto the left of\b': [left of]
+    '\bto the right of\b': [right of]
+    '^How far away is\b': [How far is, What is the distance to]
+    '^What is the distance between\b': [How far apart are, Give the distance between]
 
 net:
   geo_hidden: 512
@@ -43,4 +48,4 @@ save_every: 1000
 
 stages:
   A: {steps: 1000, lr_llm: 0.0, lr_new: 2.0e-4}
-  B: {epochs: 3, lr_llm: 1.0e-5, lr_new: 1.0e-4, init: runs/main/A/last.pt}
+  B: {epochs: 3, lr_llm: 1.0e-5, lr_new: 1.0e-4, init: /projects/beqw/ahmadmoo/decide3d_runs/main/A/last.pt}

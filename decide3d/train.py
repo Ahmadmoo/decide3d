@@ -23,7 +23,7 @@ tok = Tok(AutoTokenizer.from_pretrained(cfg["model"]))
 collate = Collate(AutoImageProcessor.from_pretrained(cfg["model"]), tok)
 train, val = Frames(cfg, "train", tok, train=True), Frames(cfg, "val", tok, train=False, subset="dev")
 val_order = torch.randperm(len(val), generator=torch.Generator().manual_seed(0)).tolist()
-n = json.loads((pathlib.Path(cfg["frames_dir"]) / "train_stats.json").read_text())["per_task"]
+n = json.loads((pathlib.Path(cfg["frames_dir"]) / "train_stats.json").read_text())["per_task_frames"]  # sampled questions per task ~ frames with that task
 w = {t: c ** cfg["loss"]["task_power"] for t, c in n.items()}
 task_w = torch.tensor([w.get(t, 0.0) for t in TASKS], device=dev) * sum(n.values()) / sum(n[t] * w[t] for t in n)  # mean weight 1 per question
 

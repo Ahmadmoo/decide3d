@@ -1,5 +1,6 @@
 import sys, os, json, re, math, hashlib, pathlib, collections
 import numpy as np
+from tfrecord_lite import records, parse_example
 
 # usage:
 #   python cavqa_convert.py val   <cavqa_val_dir>    <out_dir> [--peek] [--depth]
@@ -7,7 +8,7 @@ import numpy as np
 #   add --tasks=binary,multichoice to convert only some tasks; each task writes its own <split>_<task>.jsonl
 #   train saves only the reference frame; add --support to also save the 0-4 support frames (about 4x more disk)
 #   add --part=i/n (train only) to run n processes in parallel, i = 0..n-1; each writes its own part files
-# train root holds cavqa_<task>/1.0.0 folders (TFDS); val dir is the unpacked cavqa_val.tar.gz
+# train root holds cavqa_<task>/1.0.0 folders (TFRecords, read by tfrecord_lite.py); val dir is the unpacked cavqa_val.tar.gz
 # images are named by content hash, so later runs into the same out_dir reuse frames already saved
 
 TASKS = ["binary", "cardinality", "multichoice", "regression"]
@@ -16,8 +17,8 @@ NUM_WORDS = {w: i for i, w in enumerate("zero one two three four five six seven 
 UNIT = {"m": 1, "meter": 1, "meters": 1, "metre": 1, "metres": 1, "cm": .01, "centimeter": .01, "centimeters": .01,
         "centimetre": .01, "centimetres": .01, "mm": .001, "millimeter": .001, "millimeters": .001,
         "ft": .3048, "feet": .3048, "foot": .3048, "in": .0254, "inch": .0254, "inches": .0254}
-NUM_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*(" + "|".join(sorted(UNIT, key=len, reverse=True)) + r")?\b", re.I)
-INSTR_RE = re.compile(r"\s*(please\s+)?(answer|respond|reply|choose|select|pick)\b[^\n?]*\b(letter|option|choice|yes or no|single word|one word|number|integer|meters?|unit)\b[^\n]*", re.I)
+NUM_RE = re.compile(r"(-?\d*\.?\d+)\s*(" + "|".join(sorted(UNIT, key=len, reverse=True)) + r")?\b", re.I)
+INSTR_RE = re.compile(r"(?:(?<=[.?!\n])|^)\s*(please\s+)?(answer|respond|reply|choose|select|pick)\b[^\n?]*\b(letter|option|choice|yes or no|single word|one word|number|integer|meters?|unit)\b[^\n]*", re.I)
 MARK_RE = re.compile(r"(?:\(([A-H])\)|(?<![A-Za-z0-9'])([A-H])[\.\):])\s+")
 LIST_RE = re.compile(r"(?:options|choices)\s*(?:are)?\s*[:\-]\s*(.+)$", re.I | re.S)
 
@@ -29,7 +30,8 @@ SIGMA = math.log(1.1)
 
 
 def clean(q):
-    return re.sub(r"\s+", " ", INSTR_RE.sub("", q)).strip()
+    s = re.sub(r"\s+", " ", INSTR_RE.sub("", q)).strip()
+    return s or re.sub(r"\s+", " ", q).strip()
 
 
 def parse_options(q):
@@ -58,11 +60,12 @@ def norm(s):
 
 
 def mc_index(ans, opts):
-    m = re.match(r"^\s*\(?([A-H])\)?(?:[\.\):]|\s|$)", ans)
+    hits = [i for i, o in enumerate(opts) if norm(o) == norm(ans)]
+    if len(hits) == 1: return hits[0]
+    m = re.match(r"^\s*\(?([A-H])\)?\s*(?:[\.\):]|$)", ans)
     if m and LETTERS.index(m.group(1)) < len(opts):
         return LETTERS.index(m.group(1))
-    hits = [i for i, o in enumerate(opts) if norm(o) == norm(ans)]
-    return hits[0] if len(hits) == 1 else None
+    return None
 
 
 def to_meters(s):
@@ -96,25 +99,21 @@ def convert(task, q, a):
         return dict(type="choice", question=stem, options=opts, target=[float(j == i) for j in range(len(opts))]), None
     if task == "cardinality":
         m = re.search(r"\d+", a)
-        n = int(m.group()) if m else NUM_WORDS.get(norm(a).split(" ")[0])
+        n = int(m.group()) if m else NUM_WORDS.get(norm(a).split(" ")[0].strip("."))
         if n is None: return None, "count_answer"
         if n > 20: return None, "count_over_20"
         return dict(type="score", question=clean(q), options=COUNT_LEVELS, target=[float(j == n) for j in range(21)]), None
     if task == "regression":
         v, has_unit = to_meters(a)
         if v is None or v < 0: return None, "metric_answer"
+        if not has_unit: return None, "metric_no_unit"
         return dict(type="score", question=clean(q), options=SCORE_LEVELS, target=soft_bins(v), value_m=round(v, 4), unit_given=has_unit), None
     return None, "task"
 
 
 def save_blob(b, sub):
-    if isinstance(b, str): return b
-    if isinstance(b, np.ndarray):
-        import io
-        from PIL import Image
-        buf = io.BytesIO(); Image.fromarray(b.squeeze()).save(buf, format="PNG"); b = buf.getvalue()
     h = hashlib.sha1(b).hexdigest()[:20]
-    p = OUT / sub / h[:2] / (h + (".jpg" if b[:3] == b"\xff\xd8\xff" else ".png"))
+    p = OUT / sub / h[:2] / (h + ".png")
     if not p.exists():
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(f".tmp{os.getpid()}")
@@ -122,46 +121,38 @@ def save_blob(b, sub):
     return str(p)
 
 
-def as_str(x):
-    return x.decode() if isinstance(x, bytes) else str(x)
-
-
-def is_image_bytes(b):
-    if isinstance(b, np.ndarray) and b.ndim >= 2: return True
-    return isinstance(b, bytes) and (b[:8] == b"\x89PNG\r\n\x1a\n" or b[:3] == b"\xff\xd8\xff")
-
-
 def val_rows(root):
-    import datasets
-    dd = datasets.load_from_disk(str(root))
-    for task in dd:
-        for r in dd[task]:
-            ref = r["reference_frame"]
-            sup = [r[f"support_frame_{k}"]["image"]["path"] for k in (4, 3, 2, 1) if r.get(f"support_frame_{k}") and r[f"support_frame_{k}"].get("image")]
-            img = str(root / "images" / ref["image"]["path"])
-            depth = str(root / "images" / ref["depth_map_ground_truth"]["path"]) if DEPTH and ref.get("depth_map_ground_truth") else None
-            yield task, r["id"], r["question"], r["answer"], img, [str(root / "images" / s) for s in sup], ref.get("intrinsics"), depth
+    import pyarrow as pa
+    for task in TASKS:
+        for f in sorted((root / task).glob("*.arrow")):
+            with pa.memory_map(str(f)) as m:
+                for batch in pa.ipc.open_stream(m):
+                    for r in batch.to_pylist():
+                        ref = r["reference_frame"]
+                        sup = [r[f"support_frame_{k}"]["image"]["path"] for k in (4, 3, 2, 1) if r.get(f"support_frame_{k}") and r[f"support_frame_{k}"].get("image")]
+                        img = str(root / ref["image"]["path"])
+                        depth = str(root / ref["depth_map_ground_truth"]["path"]) if DEPTH and ref.get("depth_map_ground_truth") else None
+                        yield task, r["id"], r["question"], r["answer"], img, [str(root / s) for s in sup] if SUPPORT else [], ref.get("intrinsics"), depth
 
 
 def train_rows(root):
-    import tensorflow_datasets as tfds
     for task in TASKS:
         d = root / f"cavqa_{task}" / "1.0.0"
         if not d.exists(): continue
-        sp = tfds.even_splits("train", n=NP)[IP] if NP > 1 else "train"
-        for ex in tfds.as_numpy(tfds.builder_from_directory(str(d)).as_dataset(split=sp, shuffle_files=False)):
-            imgs = list(ex["images"])
-            ref = imgs[-1]
-            img = save_blob(ref, "images") if is_image_bytes(ref) else as_str(ref)
-            sup = [save_blob(s, "images") if is_image_bytes(s) else as_str(s) for s in imgs[:-1]] if SUPPORT else []
-            depth = None
-            if DEPTH:
-                dref = list(ex["depth_maps_ground_truth"])[-1]
-                depth = save_blob(dref, "depth_gt") if is_image_bytes(dref) else as_str(dref)
-            K = np.asarray(ex["intrinsics"])[-1].tolist()
-            for q, a in zip(ex["questions"], ex["answers"]):
-                q, a = as_str(q), as_str(a)
-                yield task, hashlib.sha1((img + q).encode()).hexdigest()[:16], q, a, img, sup, K, depth
+        for shard in sorted(d.glob("*.tfrecord-*"))[IP::NP]:
+            for rec in records(shard):
+                ex = parse_example(rec)
+                qa = [(bytes(q).decode(), bytes(a).decode()) for q, a in zip(ex["questions"], ex["answers"])]
+                if PEEK:
+                    for q, a in qa: yield task, "", q, a, "", [], None, None
+                    continue
+                img = save_blob(bytes(ex["images"][-1]), "images")
+                sup = [save_blob(bytes(s), "images") for s in ex["images"][:-1]] if SUPPORT else []
+                depth = save_blob(bytes(ex["depth_maps_ground_truth"][-1]), "depth_gt") if DEPTH else None
+                K = ex["intrinsics"].reshape(-1, 3, 3)[-1].astype(float).round(3).tolist()
+                frame = pathlib.Path(img).stem
+                for q, a in qa:
+                    yield task, hashlib.sha1((frame + q).encode()).hexdigest()[:16], q, a, img, sup, K, depth
 
 
 split, SRC, OUT = sys.argv[1], pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
@@ -192,6 +183,7 @@ for task, rid, q, a, img, sup, K, depth in rows:
     if task not in outs: outs[task] = open(OUT / f"{split}_{task}{SUF}.jsonl", "w")
     rec = dict(id=rid, source="cavqa", split=split, task=task, frame=pathlib.Path(img).stem, image=img, support_images=sup, intrinsics=K, depth_gt=depth, answer_raw=a, **rec)
     outs[task].write(json.dumps(rec) + "\n"); kept[task] += 1
+    if kept[task] % 5000000 == 0: print(task, "kept", kept[task], flush=True)
 
 for f in outs.values(): f.close()
 for t, v in bad.items():

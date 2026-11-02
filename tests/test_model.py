@@ -4,7 +4,7 @@ from PIL import Image
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast, Qwen3VLConfig, Qwen3VLForConditionalGeneration
 from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import Qwen2VLImageProcessorPil
-from decide3d.data import PX, Collate, Frames, Tok, build, invert
+from decide3d.data import PX, Collate, Frames, Tok, build, invert, sample
 from decide3d.evaluate import REPS
 from decide3d.model import Decide3D, loss_fn
 
@@ -105,6 +105,7 @@ def test_option_order_invariance(parts):
 
 def test_training_step(parts):
     tok, base, ip = parts
+    torch.manual_seed(0)
     net = Decide3D(copy.deepcopy(base), tok, NET, attn="sdpa").train_llm(True).train()
     net.base.model.language_model.gradient_checkpointing_enable()
     frozen = {n: p.clone() for n, p in net.base.named_parameters() if not p.requires_grad}
@@ -113,7 +114,7 @@ def test_training_step(parts):
     b["drop"][:4] = True
     opt = torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=1e-3)
     losses = []
-    for i in range(10):
+    for i in range(30):
         loss = loss_fn(net(b), b, torch.ones(4), 0.5)
         loss.backward()
         if i == 0:
@@ -129,6 +130,21 @@ def test_invert():
     q = invert(QUESTIONS[0])
     assert q["question"] == "Is the chair farther from the camera than the table?" and q["target"] == [1.0, 0.0]
     assert invert(QUESTIONS[1]) is QUESTIONS[1]
+    yes_no = dict(QUESTIONS[0], question="Is the plate behind of the bench?")
+    assert invert(yes_no)["question"] == "Is the plate infront of the bench?"
+    assert invert(dict(yes_no, question="Is the plate infront of the bench?"))["question"] == "Is the plate behind of the bench?"
+    assert invert(dict(yes_no, question="Is the plate to the left of the bench?"))["question"] == "Is the plate to the right of the bench?"
+    for text in ("Is the left cabinet longer than the plate?", "Is the plate infront of the shelf to the right of a radiator?", "Is the plate longer than the shelf behind the door?"):
+        q = dict(yes_no, question=text)
+        assert invert(q) is q
+
+
+def test_sample():
+    qs = [dict(id=i, task=t) for t, n in (("multichoice", 2000), ("binary", 200), ("cardinality", 3), ("regression", 90)) for i in range(n)]
+    got = sample(qs, 32)
+    n = {t: sum(q["task"] == t for q in got) for t in ("multichoice", "binary", "cardinality", "regression")}
+    assert len(got) == 32 and len({(q["task"], q["id"]) for q in got}) == 32 and n["cardinality"] == 3 and min(n["multichoice"], n["binary"], n["regression"]) >= 9
+    assert len(sample(qs[:5], 32)) == 5
 
 
 def test_moge_pool():
@@ -174,7 +190,8 @@ def test_frames(dataset, parts):
     cfg = yaml.safe_load(open(ROOT / "configs/train.yaml")) | dict(frames_dir=str(dataset / "frames"), geom_dir=str(dataset / "geom"))
     cfg["data"] |= dict(max_questions=4, train_pixels=[20000], eval_pixels=30000)
     train = Frames(cfg, "train", tok, train=True)
-    assert len(train) == 9 and sorted(train.items[:, 2].tolist()) == [0] * 6 + [4] * 3
+    assert len(train) == 6  # one visit per frame, however many questions it has
+    assert all(len(train[i]["questions"]) == 4 for i in range(6))
     dev, test = (Frames(cfg, "val", tok, train=False, subset=s) for s in ("dev", "test"))
     assert len(dev) and len(test) and len(dev) + len(test) == 12
     b = Collate(ip, tok)([train[0], train[1]])
@@ -206,7 +223,7 @@ def test_scripts(dataset, tiny_dir, tmp_path):
     sh("decide3d.train", path, "A"), sh("decide3d.train", path, "B")
     assert '"step"' not in sh("decide3d.train", path, "B")
     log = [json.loads(l) for l in open(run / "B/log.jsonl")]
-    assert log[0]["steps"] == 2 and any("dev" in l for l in log)
+    assert log[0]["steps"] == 1 and any("dev" in l for l in log)
     sh("decide3d.evaluate", path, run / "B/last.pt")
     report = json.loads((run / "B/report.json").read_text())
     assert report["order"]["max_dp"] < 1e-2  # bf16 noise; flips only happen at near-ties of this random model

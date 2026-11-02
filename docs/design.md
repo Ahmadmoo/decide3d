@@ -62,7 +62,8 @@ The mask also makes questions independent, so many questions share one image enc
 | Setting | Value |
 |---|---|
 | Loss | soft-target cross entropy + 0.5 · RPS for score questions |
-| Task weights | ∝ (questions in task)^-0.5, mean weight 1 |
+| Questions | 32 per frame visit, shared evenly over the tasks of the frame (a frame has ~2,600, ~88% multichoice) |
+| Task weights | ∝ (frames with task)^-0.5, mean weight 1 per sampled question |
 | Optimizer | AdamW, β = (0.9, 0.95), weight decay 0.1 (none on norms, biases, vectors, embeddings), grad clip 1.0 |
 | Schedule | WSD: 3% warmup, flat, linear decay over the last 20% |
 | Batch | 64 frames per step (2 frames packed per sequence per GPU, gradient accumulation) |
@@ -78,13 +79,13 @@ Muon is not used: fine-tuning an Adam-pretrained model with Muon does worse.
 |---|---|
 | Resolution | 0.25 / 0.5 / 0.8 MP per frame (eval and Thor: 0.3 MP) |
 | Paraphrase | regex rewrites from `configs/train.yaml` |
-| Relation inversion | closer ↔ farther, left ↔ right, … with the label flipped (yes/no and 2-option questions only) |
+| Relation inversion | closer ↔ farther, left ↔ right, … with the label flipped (yes/no and 2-option questions with exactly one relation phrase; left, right, behind inside object names block it) |
 | Geometry dropout | 15% of frames get no geometry |
 | Appearance masking | 30% of frames: 30–60% of visual tokens replaced by a learned mask token, geometry kept, DeepStack zeroed there |
 
 ### 2.2 Cost
 
-About 1 day on 2× H100 for A + B (estimate). Memory per GPU: ~30 GB for weights, gradients and Adam states, plus activations.
+Measured on 2× H100 with 64 frames per step: 8.6 s / step in A, 9.8 s / step in B, 43 GB per GPU. A (1000 steps) + B (3 epochs = 11,317 steps) is about 34 h and 8,200 SU, evals included (estimate from those speeds).
 
 ---
 
