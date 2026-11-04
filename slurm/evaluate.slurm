@@ -14,4 +14,4 @@
 set -euo pipefail
 export PYTHONNOUSERSITE=1
 cd $HOME/decide3d
-$HOME/.conda/envs/decide3d/bin/python -m decide3d.evaluate configs/train.yaml ${1:-/projects/beqw/ahmadmoo/decide3d_runs/main/B/last.pt}
+$HOME/.conda/envs/decide3d/bin/python -m decide3d.evaluate configs/train.yaml ${1:-/projects/beqw/ahmadmoo/decide3d_runs/v2/B/best.pt}

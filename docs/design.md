@@ -1,113 +1,125 @@
-# Design: network and training
+# Design v2: network and training
 
-One RGB image in. Typed 3D questions with text options in. One calibrated probability per option out, in one forward pass, and the same answer whatever the option order.
+One RGB image in. Typed 3D questions in. Out: one calibrated probability per option (yes/no, choice), or a calibrated distribution over counts or distances. Everything in one forward pass, with the same answer whatever the option order.
 
 ---
 
-## 1. Network
+## 1. Changes from v1
+
+| Part | v1 | v2 | Why |
+|---|---|---|---|
+| Backbone | Qwen3-VL-2B, full fine-tune | **Qwen3-VL-4B, LoRA r=64** | 4B ≈ 8B on CausalSpatial at half the cost; LoRA memorizes scans less and keeps pretrained knowledge |
+| Geometry | Added into visual tokens (`x + α·g·e`) | **Separate geometry tokens** (second vision block) | Additive fusion became ~79% constant bias; removing it changed nothing |
+| Counts | 21 option rows | **Count head**, one readout token | No number-as-text comparison; 1 row instead of 21 |
+| Distances | 22 option rows (5 cm–10 m) | **Metric head**: 119 log bins (×1.06) from 2 cm to 20 m + "< 2 cm" + "> 20 m" | Continuous estimate, manipulation-scale resolution, 1 row instead of 22 |
+| Box coordinates in text | Source pixels, always | Qwen3-VL 0–1000 scale, dropped for 50% of training questions | Uses Qwen's grounding format; the model also works with names only |
+| Calibration | 3 temperatures | 4 (yes_no, choice, count, metric); metric estimate = mode, unchanged by temperature | v1's mean estimate got worse after calibration |
+| Questions per frame visit | 32 | 128 | More signal per image; number questions are now cheap |
+| Schedule | 3 epochs, last checkpoint | Steps-based (A 500, B 3000), EMA, best checkpoint by calibrated dev NLL | v1 overfit after ~1–2k steps |
+| Loss | CE + RPS | + label smoothing 0.05 (yes_no, choice); task weight power −0.25 | Overconfidence; cardinality overfit first |
+| Augmentation | — | + horizontal flip (image, geometry, boxes, left ↔ right) | Appearance diversity |
+| Data | CA-VQA | `sources:` list with shares, scenes sampled uniformly | Ready for Omni3D + GraspNet-1B |
+
+---
+
+## 2. Network
 
 ```
-image ──► Qwen3-VL ViT (frozen) ──► merger (trained) ──► visual tokens ──┐
-  │                         └──► DeepStack features (layers 1-3) ───────┤
-  └──► MoGe-2 ViT-S (frozen, precomputed) ──► per-token geometry ─► gated add ─┘
-                                      └──► scene stats ─► scene token
+image ──► Qwen3-VL ViT (frozen) ──► merger (trained) ──► visual tokens (1 per 32×32 px) + DeepStack
+  └──► MoGe-2 (offline) ──► 16-px cells ──► 4×4 cells per 64×64 px ──► MLP ──► geometry tokens (1 per 2×2 visual tokens)
+                                     └──► scene stats ──► scene token
 
-[system | image | scene] [question 1] [option 1.1] [option 1.2] ... [question 2] [option 2.1] ...
-                     └──────── Qwen3-VL-2B LLM, segment mask + shared positions ────────┘
-last token of every option ──► s = h · (W_yes − W_no) ──► set head (per question) ──► softmax / T_type
+[system] [image block] [geometry block] [scene] [question 1] [option 1.1] [option 1.2] ... [count question ▸] [metric question ▸] ...
+        └────────────── Qwen3-VL-4B LLM + LoRA, segment mask + shared positions ──────────────┘
+option rows   ──► s = h · (W_yes − W_no) ──► set head ──► softmax / T_type
+count  ▸ token ──► count head (21)          ──► softmax / T_count
+metric ▸ token ──► metric head (121 bins)   ──► softmax / T_metric
 ```
 
-| Part | Choice | Why |
-|---|---|---|
-| Backbone | Qwen3-VL-2B-Instruct | Full attention, so a custom mask is simple. Qwen3.5 is hybrid (Gated DeltaNet) and cannot take it. ~35% faster on Thor than Qwen3.5-2B (28.0 vs 43.3 ms at 2k tokens) |
-| Vision | ViT frozen, merger + DeepStack mergers trained | Keeps pretrained vision; the mergers adapt it to geometry questions |
-| Geometry | MoGe-2 ViT-S, frozen, run once offline (`preprocessing/moge_geometry.py`) | Metric depth + normals + intrinsics from one RGB image |
-| Geometry adapter | Per visual token: log-depth (8 Fourier freqs, sin + cos), ray (3), normal (3), valid fraction, depth spread = 24 dims → MLP 24→512→2048 → `x + α ⊙ σ(W[LN x; LN e]) ⊙ e`, α = 0 at start | Zero start = the pretrained model is unchanged at step 0. The gate lets the model ignore bad geometry |
-| Scene token | `\n` embedding + zero-init MLP of 6 scene stats (log-depth p5/p50/p95, valid fraction, fov x/y) | Global scale and field of view |
-| Option score | `s_k = h_k · (W_yes − W_no)`, from the LM head rows | A real Yes/No answer from step 0, no new head to learn first |
-| Set head | 2 layers, width 512, no positions, zero-init output: `z_k = s_k + Δ_k` | Options of a question see each other, still order-free |
-| Output | softmax over the options of a question, one temperature per type (yes_no, choice, score) | Calibrated probabilities |
+### 2.1 Parts
 
-### 1.1 Order invariance (exact)
+| Part | Design |
+|---|---|
+| Backbone | Qwen3-VL-4B-Instruct (36 layers, full attention). ViT frozen; mergers trained (fp32, LR 1e-5); LoRA r=64, α=128 on q, k, v, o, gate, up, down of every LLM layer; base weights frozen in bf16 |
+| Geometry tokens | Per 2×2 visual tokens: the 4×4 MoGe cells under it (log-depth, normal xyz, valid fraction, spread; zero where invalid) + ray of its center + Fourier of its mean log-depth → MLP (115 → 1024 → d) + a learned modality embedding. ~80 tokens at 0.3 MP |
+| Geometry positions | A second vision block after the image: token (r, c) at rows / cols 2r, 2c of its own block, so it has the same offset to every visual token it covers |
+| Geometry dropout | 15% of training frames have no geometry block at all, so the model also runs without MoGe |
+| Scene token | `\n` embedding + zero-init MLP of 6 scene stats (log-depth p5/p50/p95, valid fraction, fov x/y); off when there is no geometry |
+| Option score | `s_k = h_k · (W_yes − W_no)` from the LM head rows, + zero-init set head (2 layers, width 512, no positions) |
+| Number heads | LayerNorm → 512 → GELU → 21 (count) or 121 (metric); zero-init output. Read from the last token of `Question … Answer with a number.<assistant prefix>` |
+| Appearance masking | 30% of frames: 30–60% of visual tokens → learned mask token, DeepStack zeroed there (geometry kept) |
+
+### 2.2 Order invariance (exact)
 
 | Rule | Effect |
 |---|---|
-| Segment mask: context sees context; a question sees context + itself; an option sees context + its question + itself | No option can see another option |
+| Segment mask: context sees context; a question sees context + itself; an option sees context + its question + itself | No option sees another option; no question sees another question |
 | All questions start at the same position; all options of a question start at the same position | An option's input is identical whatever its place |
-| Set head has no positional encoding | Equivariant over options |
+| Set head has no positional encoding; number heads have no options | Equivariant / no order at all |
 
-So the output for an option does not depend on where it is: exact in math, equal up to float rounding in practice. Reordering cannot change the answer (Jev-style models lose 23–64% of first-try successes under reordering).
+`tests/test_model.py` checks that one packed pass (two frames, with and without geometry, option and number questions) equals running every option and every number question alone with the plain causal mask.
 
-The mask also makes questions independent, so many questions share one image encoding in one pass. `tests/test_model.py` checks that one pass equals running every option alone.
+### 2.3 Question types
 
-### 1.2 Question types
-
-| Type | Tasks | Options | Target | Extra loss |
+| Type | Task | Output | Target | Extra loss |
 |---|---|---|---|---|
-| yes_no | binary | no, yes | one-hot | — |
-| choice | multichoice | object names from the question | one-hot | — |
-| score | cardinality | 0 … 20 | one-hot | RPS |
-| score | regression | 22 log-spaced distance bins | Gaussian in log space, σ = log 1.1 | RPS |
+| yes_no | binary | 2 option rows | one-hot, smoothed 0.05 | — |
+| choice | multichoice | option rows (object names) | one-hot, smoothed 0.05 | — |
+| count | cardinality | count head, 0 … 20 | one-hot | RPS |
+| metric | regression | metric head, 121 bins | Gaussian in log space (σ = log 1.05); one-hot in the edge bins | RPS |
+
+Records with `type: score` (CA-VQA) become count or metric by task. New sources can write `count` / `metric` directly.
 
 ---
 
-## 2. Training
+## 3. Training
 
 | Stage | Steps | Trained | LR |
 |---|---|---|---|
-| A | 1000 | new modules only (adapter, scene token, mask token, Yes−No row, set head) | 2e-4 |
-| B | 3 epochs | + LLM layers, vision mergers | LLM 1e-5, new 1e-4 |
-| C | — | one temperature per type, fit on val-dev | grid search on NLL |
+| A | 500 | new modules: geometry tokens, scene token, mask token, Yes−No row, set head, number heads | 2e-4 |
+| B | 3000 | + LoRA, + mergers | LoRA 1e-4, mergers 1e-5, new 1e-4 |
+| C | — | one temperature per type, fit on val-dev (`evaluate.py`) | grid search on NLL |
 
 | Setting | Value |
 |---|---|
-| Loss | soft-target cross entropy + 0.5 · RPS for score questions |
-| Questions | 32 per frame visit, shared evenly over the tasks of the frame (a frame has ~2,600, ~88% multichoice) |
-| Task weights | ∝ (frames with task)^-0.5, mean weight 1 per sampled question |
-| Optimizer | AdamW, β = (0.9, 0.95), weight decay 0.1 (none on norms, biases, vectors, embeddings), grad clip 1.0 |
+| Batch | 64 frames per step (1 frame per sequence per GPU at 4B, gradient accumulation) |
+| Questions | 128 per frame visit, shared evenly over the tasks of the frame |
+| Loss | soft-target CE + 0.5 · RPS (count, metric); task weight ∝ (share of questions)^-0.25, mean 1 |
+| Optimizer | AdamW β = (0.9, 0.95), weight decay 0.1 (none on norms, biases, vectors, embeddings, LoRA), grad clip 1.0 |
 | Schedule | WSD: 3% warmup, flat, linear decay over the last 20% |
-| Batch | 64 frames per step (2 frames packed per sequence per GPU, gradient accumulation) |
-| Precision | fp32 master weights, bf16 autocast, fp32 readout and softmax |
-| Speed | FlexAttention block mask (skips masked blocks), packed frames, gradient checkpointing, DDP |
-| Frozen | ViT, token embeddings / LM head |
+| EMA | 0.999 (with warm-up); dev eval and `best.pt` use the EMA weights |
+| Best checkpoint | lowest dev NLL after a temperature fit on the same dev questions |
+| Precision | bf16 frozen base; fp32 LoRA, mergers and new modules; bf16 autocast; fp32 readout |
+| Speed | FlexAttention block mask, gradient checkpointing, DDP (`find_unused_parameters`: a micro-batch may have no count / metric / geometry) |
+| Full fine-tune | `net.lora_rank: 0` → fp32 LLM layers as in v1 |
 
-Muon is not used: fine-tuning an Adam-pretrained model with Muon does worse.
+### 3.1 Data
 
-### 2.1 Augmentation
-
-| Augmentation | Setting |
+| Setting | Value |
 |---|---|
+| Sources | `sources:` in `configs/train.yaml`: frames_dir, geom_dir, share |
+| Sampling | source by share, then scenes uniform (`<split>_scenes.npy`, one id per frame; without it each frame is its own scene), then frames uniform |
+| Val | each source's `val` split; dev / test from the index subset column (a source without subsets uses all of val for both) |
 | Resolution | 0.25 / 0.5 / 0.8 MP per frame (eval and Thor: 0.3 MP) |
-| Paraphrase | regex rewrites from `configs/train.yaml` |
-| Relation inversion | closer ↔ farther, left ↔ right, … with the label flipped (yes/no and 2-option questions with exactly one relation phrase; left, right, behind inside object names block it) |
-| Geometry dropout | 15% of frames get no geometry |
-| Appearance masking | 30% of frames: 30–60% of visual tokens replaced by a learned mask token, geometry kept, DeepStack zeroed there |
-
-### 2.2 Cost
-
-Measured on 2× H100 with 64 frames per step: 8.6 s / step in A, 9.8 s / step in B, 43 GB per GPU. A (1000 steps) + B (3 epochs = 11,317 steps) is about 34 h and 8,200 SU, evals included (estimate from those speeds).
+| Text | paraphrase rules, relation inversion with flipped label, box coordinates → 0–1000 or dropped (50%) |
+| Flip | 50%: image, MoGe grid (normal x negated, cx mirrored), box x-coordinates, left ↔ right words; labels unchanged |
 
 ---
 
-## 3. Evaluation (`decide3d/evaluate.py`)
+## 4. Evaluation (`decide3d/evaluate.py`)
 
 | Metric | For |
 |---|---|
-| Accuracy, NLL, Brier, ECE (15 bins) | all types |
-| RPS | score questions |
-| acc@10%, acc@25%, MRA | regression (estimate = probability-weighted geometric mean of the bins) |
-| Flip rate, max \|Δp\| under shuffled options | order robustness |
+| Accuracy, NLL, Brier, ECE (15 bins) | all types, per task, per source |
+| RPS | count, metric |
+| acc@10%, acc@25%, MRA, median AbsRel | metric (estimate = mode, refined between neighbour bins) |
+| Same metrics with geometry off | value of the geometry tokens |
+| Flip rate, max \|Δp\| under shuffled options | order robustness (yes_no, choice) |
 
-Val is split by video into dev (eval during training, temperature fit) and test (final numbers).
+Outputs `report.json` and `final.pt` (model + temperatures) next to the checkpoint.
 
 ---
 
-## 4. Deployment on Jetson Thor (planned)
+## 5. Not in v2
 
-| Step | Work |
-|---|---|
-| 1 | MoGe-2 ViT-S at 1200 tokens + Qwen3-VL ViT on the image |
-| 2 | Prefix [system, image, scene] once → KV cache |
-| 3 | Questions as batched rows on the prefix cache, then options as batched rows on the question cache |
-
-This gives the same numbers as the training mask, with no custom mask kernel. Target: ~10 Hz at 0.3 MP.
+Dense depth head, sensor depth input, robot state inputs, action-conditioned questions, Thor KV-cache inference.

@@ -1,18 +1,24 @@
-model: Qwen/Qwen3-VL-2B-Instruct
-frames_dir: /projects/beqw/ahmadmoo/cavqa/frames
-geom_dir: /projects/beqw/ahmadmoo/cavqa/geom
-out_dir: /projects/beqw/ahmadmoo/decide3d_runs/main
+model: Qwen/Qwen3-VL-4B-Instruct
+out_dir: /projects/beqw/ahmadmoo/decide3d_runs/v2
 attn: flex                    # flex: block mask, packed frames (training); sdpa: dense mask (tests, small eval)
 
+sources:                      # share = fraction of frame visits; inside a source scenes are drawn uniformly (<split>_scenes.npy, else one scene per frame)
+  - {name: cavqa, frames_dir: /projects/beqw/ahmadmoo/cavqa/frames, geom_dir: /projects/beqw/ahmadmoo/cavqa/geom, share: 1.0}
+  # - {name: omni3d, frames_dir: /projects/beqw/ahmadmoo/omni3d/frames, geom_dir: /projects/beqw/ahmadmoo/omni3d/geom, share: 0.35}
+  # - {name: graspnet, frames_dir: /projects/beqw/ahmadmoo/graspnet/frames, geom_dir: /projects/beqw/ahmadmoo/graspnet/geom, share: 0.15}
+
 data:
-  max_questions: 32           # train: sampled per frame visit, even over tasks; eval: every question, in chunks of this size
-  frames_per_micro: 2         # frames packed into one sequence per GPU
+  max_questions: 128          # train: sampled per frame visit, even over tasks; eval: every question, in chunks of this size
+  frames_per_micro: 1         # frames packed into one sequence per GPU (4B, 128 questions: ~6-9k tokens per frame)
   train_pixels: [250000, 500000, 800000]
   eval_pixels: 300000         # Thor setting
-  invert_prob: 0.5            # closer <-> farther, left <-> right, ... with flipped label (yes/no and 2-option only)
-  geo_drop: 0.15              # whole frame without geometry
+  invert_prob: 0.5            # closer <-> farther, ... with flipped label (yes/no and 2-option only)
+  flip_prob: 0.5              # horizontal flip: image, geometry, boxes, left <-> right words
+  box_drop: 0.5               # train: drop the box coordinates of a question (names only)
+  eval_box_drop: 0.0          # eval: 1.0 = names only
+  geo_drop: 0.15              # whole frame without the geometry block
   mask_prob: 0.3              # appearance masking: frames affected
-  mask_ratio: [0.3, 0.6]      # fraction of visual tokens replaced by a learned mask token (geometry kept)
+  mask_ratio: [0.3, 0.6]      # fraction of visual tokens replaced by a learned mask token
   workers: 8
   paraphrase:                 # regex -> rewrites; extend after `build_frames.py --templates`
     '\bcloser to\b': [nearer to]
@@ -26,26 +32,31 @@ data:
     '^What is the distance between\b': [How far apart are, Give the distance between]
 
 net:
-  geo_hidden: 512
+  lora_rank: 64               # 0 = full fine-tune of the LLM layers (fp32 master weights)
+  lora_alpha: 128
+  geo_hidden: 1024
   set_dim: 512
   set_layers: 2
+  head_dim: 512               # count and metric heads
 
 loss:
-  rps_weight: 0.5             # ordinal penalty for score questions (counts, metric bins)
-  task_power: -0.5            # task weight ~ (questions in task) ^ power
+  rps_weight: 0.5             # ordinal penalty for counts and metric bins
+  task_power: -0.25           # task weight ~ (share of questions in task) ^ power
+  smooth: 0.05                # label smoothing on yes_no and choice
 
 optim:
   betas: [0.9, 0.95]
-  weight_decay: 0.1
+  weight_decay: 0.1           # not on norms, biases, vectors, embeddings, LoRA
   grad_clip: 1.0
   warmup: 0.03                # WSD schedule: warmup, flat, linear decay over the last `decay` fraction
   decay: 0.2
+  ema: 0.999
 
 batch_frames: 64              # global frames per optimizer step
-eval_every: 500
-eval_questions: 5000          # dev questions used for periodic eval
-save_every: 1000
+eval_every: 250
+eval_questions: 5000          # dev questions per source for periodic eval
+save_every: 250
 
 stages:
-  A: {steps: 1000, lr_llm: 0.0, lr_new: 2.0e-4}
-  B: {epochs: 3, lr_llm: 1.0e-5, lr_new: 1.0e-4, init: /projects/beqw/ahmadmoo/decide3d_runs/main/A/last.pt}
+  A: {steps: 500, lr_llm: 0.0, lr_new: 2.0e-4}
+  B: {steps: 3000, lr_llm: 1.0e-4, lr_merger: 1.0e-5, lr_new: 1.0e-4, init: /projects/beqw/ahmadmoo/decide3d_runs/v2/A/last.pt}

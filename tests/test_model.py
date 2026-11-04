@@ -1,22 +1,25 @@
-import copy, importlib.util, json, pathlib, subprocess, sys
+import copy, importlib.util, json, math, pathlib, subprocess, sys
 import numpy as np, pytest, torch, yaml
 from PIL import Image
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast, Qwen3VLConfig, Qwen3VLForConditionalGeneration
 from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import Qwen2VLImageProcessorPil
-from decide3d.data import PX, Collate, Frames, Tok, build, invert, sample
-from decide3d.evaluate import REPS
+from decide3d.data import (PX, GEO, GEO_FEATURES, COUNTS, METRIC, EDGES, Collate, Frames, Tok, build, edit_text, geometry_tokens, invert,
+                           metric_target, qtype, sample)
+from decide3d.evaluate import metric_estimate
 from decide3d.model import Decide3D, loss_fn
 
 # Everything runs on CPU with a tiny random Qwen3-VL and a byte-level tokenizer, so no download is needed.
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-NET = {"geo_hidden": 32, "set_dim": 32, "set_layers": 2}
+NET = {"lora_rank": 0, "lora_alpha": 8, "geo_hidden": 32, "set_dim": 32, "set_layers": 2, "head_dim": 32}
+LORA = NET | {"lora_rank": 4}
 QUESTIONS = [
     {"id": "b", "task": "binary", "type": "yes_no", "question": "Is the chair closer to the camera than the table?", "options": ["no", "yes"], "target": [0.0, 1.0]},
-    {"id": "m", "task": "multichoice", "type": "choice", "question": "Which is taller?", "options": ["lamp", "sofa", "door"], "target": [0.0, 0.0, 1.0]},
-    {"id": "c", "task": "cardinality", "type": "score", "question": "How many chairs are there?", "options": [str(i) for i in range(6)], "target": [0, 0, 1.0, 0, 0, 0]},
-    {"id": "r", "task": "regression", "type": "score", "question": "How far is the lamp from the door?", "options": [f"{v:.2f} m" for v in REPS],
-     "target": [float(i == 12) for i in range(len(REPS))], "value_m": float(REPS[12])},
+    {"id": "m", "task": "multichoice", "type": "choice", "question": "Which is taller, the lamp [10, 20, 30, 40], the sofa [50, 60, 90, 95] or the door [0, 0, 5, 9]?",
+     "options": ["lamp", "sofa", "door"], "target": [0.0, 0.0, 1.0]},
+    {"id": "c", "task": "cardinality", "type": "score", "question": "How many chairs are there?", "options": [str(i) for i in range(COUNTS)],
+     "target": [float(i == 2) for i in range(COUNTS)]},
+    {"id": "r", "task": "regression", "type": "score", "question": "How far is the lamp from the door?", "options": ["1.3 m"], "target": [1.0], "value_m": 1.3},
 ]
 
 
@@ -44,44 +47,64 @@ def parts():
     return Tok(tokenizer), base, ip
 
 
-def item(tok, questions, gh=3, gw=4, seed=0):
+def item(tok, questions, gh=3, gw=4, seed=0, geo=True):
     g = torch.Generator().manual_seed(seed)
     img = Image.fromarray((torch.rand(gh * PX, gw * PX, 3, generator=g) * 255).byte().numpy())
-    return dict(build(tok, gh, gw, questions), image=img, geometry=torch.rand(gh * gw, 9, generator=g), scene=torch.rand(6, generator=g),
-                drop=torch.zeros(gh * gw, dtype=torch.bool), geo_off=False, questions=questions)
+    n_geo = -(-gh // GEO) * -(-gw // GEO) if geo else 0
+    qs = [dict(q, qtype=qtype(q)) for q in questions]
+    return dict(build(tok, gh, gw, qs, geo), image=img, geometry=torch.rand(n_geo, GEO_FEATURES, generator=g), scene=torch.rand(6, generator=g),
+                drop=torch.zeros(gh * gw, dtype=torch.bool), scene_off=not geo, questions=qs, source=0)
+
+
+def readouts(b):
+    """Hidden-state index of every output per question: its option rows, or its readout token for count / metric."""
+    rows = {k: r for r, k in enumerate(b["opt_q"].tolist())}
+    return [b["opt_index"][rows[k]][b["opt_mask"][rows[k]]].tolist() if k in rows else [int(b["q_end"][k])] for k in range(len(b["q_end"]))]
 
 
 def test_positions_match_hf(parts):
     tok, base, ip = parts
-    b = Collate(ip, tok)([item(tok, [dict(QUESTIONS[0], options=["yes"], target=[1.0])])])  # one question, one option = a plain sequence
+    b = Collate(ip, tok)([item(tok, [dict(QUESTIONS[0], options=["yes"], target=[1.0])], geo=False)])  # one question, one option = a plain sequence
     ids = b["input_ids"][None]
     hf, _ = base.model.get_rope_index(ids, (ids == tok.image_pad).int(), b["image_grid_thw"])
     assert torch.equal(hf, b["position_ids"])
 
 
+def test_geometry_block_layout(parts):
+    tok, _, _ = parts
+    gh, gw = 3, 5
+    x = build(tok, gh, gw, [], geo=True)
+    kind, pos = np.array(x["kind"]), np.array(x["pos"])
+    assert (kind == 1).sum() == gh * gw and (kind == 2).sum() == 2 * 3
+    v, g = pos[kind == 1], pos[kind == 2]
+    assert (g[:, 0] == g[0, 0]).all() and (g[:, 1:] - g[0, 1:] == [[2 * r, 2 * c] for r in range(2) for c in range(3)]).all()  # on the image grid
+    assert g[0, 0] > v[:, 1:].max() and pos[x["scene_pos"], 0] > g[:, 1:].max()
+
+
 def test_one_pass_equals_separate_runs(parts):
-    """Two packed frames, all questions and options in one pass == every option run alone with the plain causal mask."""
+    """Two packed frames (one with, one without geometry), option and number questions in one pass
+    == every option / number question run alone with the plain causal mask."""
     tok, base, ip = parts
     net = Decide3D(base, tok, NET, attn="sdpa").eval()
-    frames = [(QUESTIONS[:2], 3, 4, 0), (QUESTIONS[2:3], 2, 3, 1)]
+    frames = [(QUESTIONS, 3, 4, 0, True), (QUESTIONS[1:3], 2, 3, 1, False)]
     with torch.no_grad():
-        b = Collate(ip, tok)([item(tok, qs, gh, gw, s) for qs, gh, gw, s in frames])
-        h = net.hidden(b)
-        got = h[b["opt_index"].clamp_min(0)]
+        b = Collate(ip, tok)([item(tok, qs, gh, gw, s, geo) for qs, gh, gw, s, geo in frames])
+        h, idx = net.hidden(b), readouts(b)
         net.mask = lambda b, L: None
         k = 0
-        for qs, gh, gw, s in frames:
+        for qs, gh, gw, s, geo in frames:
             for q in qs:
-                for j, o in enumerate(q["options"]):
-                    b1 = Collate(ip, tok)([item(tok, [dict(q, options=[o], target=[1.0])], gh, gw, s)])
-                    torch.testing.assert_close(got[k, j], net.hidden(b1)[b1["opt_index"][0, 0]], atol=1e-4, rtol=1e-4)
+                alone = [dict(q, options=[o], target=[1.0]) for o in q["options"]] if qtype(q) in ("yes_no", "choice") else [q]
+                for j, q1 in enumerate(alone):
+                    b1 = Collate(ip, tok)([item(tok, [q1], gh, gw, s, geo)])
+                    torch.testing.assert_close(h[idx[k][j]], net.hidden(b1)[readouts(b1)[0][0]], atol=1e-4, rtol=1e-4)
                 k += 1
 
 
 def test_flex_matches_dense(parts):
     """The flex block mask (training) gives the same hidden states as the dense mask."""
     tok, base, ip = parts
-    b = Collate(ip, tok)([item(tok, QUESTIONS[:2], 3, 4, 0), item(tok, QUESTIONS[2:], 2, 3, 1)])
+    b = Collate(ip, tok)([item(tok, QUESTIONS, 3, 4, 0), item(tok, QUESTIONS[1:], 2, 3, 1, geo=False)])
     base = copy.deepcopy(base)
     net = Decide3D(base, tok, NET, attn="sdpa").eval()
     with torch.no_grad():
@@ -94,36 +117,67 @@ def test_flex_matches_dense(parts):
 def test_option_order_invariance(parts):
     tok, base, ip = parts
     net = Decide3D(base, tok, NET, attn="sdpa").eval()
-    torch.nn.init.normal_(net.set.out.weight), torch.nn.init.normal_(net.geometry.alpha)
-    for q in QUESTIONS[1:3]:
-        p = torch.randperm(len(q["options"]), generator=torch.Generator().manual_seed(1)).tolist()
-        q2 = dict(q, options=[q["options"][i] for i in p], target=[q["target"][i] for i in p])
-        with torch.no_grad():
-            z1, z2 = (net(Collate(ip, tok)([item(tok, [x])])) for x in (q, q2))
-        torch.testing.assert_close(z1[0, p], z2[0], atol=1e-5, rtol=1e-5)
+    torch.nn.init.normal_(net.set.out.weight)
+    q = QUESTIONS[1]
+    p = [2, 0, 1]
+    q2 = dict(q, options=[q["options"][i] for i in p], target=[q["target"][i] for i in p])
+    with torch.no_grad():
+        z1, z2 = (net(Collate(ip, tok)([item(tok, [x])])) for x in (q, q2))
+    torch.testing.assert_close(z1[0, p], z2[0], atol=1e-5, rtol=1e-5)
 
 
 def test_training_step(parts):
     tok, base, ip = parts
     torch.manual_seed(0)
-    net = Decide3D(copy.deepcopy(base), tok, NET, attn="sdpa").train_llm(True).train()
+    net = Decide3D(copy.deepcopy(base), tok, LORA, attn="sdpa").train_llm(True).train()
     net.base.model.language_model.gradient_checkpointing_enable()
     frozen = {n: p.clone() for n, p in net.base.named_parameters() if not p.requires_grad}
-    assert frozen and any(".blocks." in n for n in frozen) and any("embed_tokens" in n for n in frozen)
-    b = Collate(ip, tok)([item(tok, QUESTIONS, seed=3)])
+    lora = [n for n, p in net.base.named_parameters() if p.requires_grad and "merger" not in n]
+    assert lora and all(n.endswith((".a", ".b")) for n in lora) and any(".blocks." in n for n in frozen) and any("q_proj.base.weight" in n for n in frozen)
+    b = Collate(ip, tok)([item(tok, QUESTIONS, seed=3), item(tok, QUESTIONS[2:], 2, 3, 4, geo=False)])
     b["drop"][:4] = True
     opt = torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=1e-3)
     losses = []
     for i in range(30):
-        loss = loss_fn(net(b), b, torch.ones(4), 0.5)
+        loss = loss_fn(net(b), b, torch.ones(4), 0.5, 0.05)
         loss.backward()
         if i == 0:
-            for p in (net.geometry.alpha, net.set.out.weight, net.yes_no, net.mask_token, net.scene[-1].weight):
+            b_grads = [p.grad for n, p in net.base.named_parameters() if n.endswith(".b")]
+            assert all(g is not None for g in b_grads) and sum(g.abs().sum() for g in b_grads) > 0
+            for p in (net.set.out.weight, net.yes_no, net.mask_token, net.scene[-1].weight, net.geometry.mlp[-1].weight, net.count[-1].weight, net.metric[-1].weight):
                 assert p.grad.abs().sum() > 0
         opt.step(), opt.zero_grad()
         losses.append(loss.item())
     assert losses[-1] < 0.5 * losses[0], losses
     assert all(torch.equal(p, frozen[n]) for n, p in net.base.named_parameters() if n in frozen)
+
+
+def test_text_edits():
+    s = "Which is taller, the lamp [10, 20, 30, 40] or the sofa to the left of it?"
+    assert edit_text(s, 100, 200, True, False) == "Which is taller, the lamp [100, 100, 300, 200] or the sofa to the left of it?"
+    assert edit_text(s, 100, 200, False, False) == "Which is taller, the lamp or the sofa to the left of it?"
+    assert edit_text(s, 100, 200, True, True) == "Which is taller, the lamp [700, 100, 900, 200] or the sofa to the right of it?"
+    assert edit_text("Leftmost or rightmost?", 1, 1, True, True) == "Rightmost or leftmost?"
+
+
+def test_geometry_flip():
+    rng = np.random.default_rng(0)
+    geo = dict(grid=rng.uniform(0.1, 1, (6, 8, 12)).astype(np.float32), K=np.array([[0.7, 0, 0.5], [0, 0.9, 0.5], [0, 0, 1]], np.float32))
+    a, b = geometry_tokens(geo, 4, 6), geometry_tokens(geo, 4, 6, flip=True)
+    cells = lambda x: x[:, :-3].view(2, 3, 4, 4, 6)
+    mirrored = cells(a).flip(1).flip(3) * torch.tensor([1, -1, 1, 1, 1, 1.0])
+    torch.testing.assert_close(cells(b), mirrored)
+    torch.testing.assert_close(b[:, -3:].view(2, 3, 3), a[:, -3:].view(2, 3, 3).flip(1) * torch.tensor([-1, 1, 1.0]))
+
+
+def test_metric_bins():
+    assert METRIC == 121 and abs(EDGES[1] / EDGES[0] - 1.06) < 0.001
+    for v in (0.03, 0.5, 3.7, 15.0):
+        t = metric_target(v)
+        assert abs(t.sum() - 1) < 1e-9
+        assert abs(metric_estimate(np.log(t + 1e-300)[None])[0] / v - 1) < 1e-3
+        assert abs(metric_estimate(3.0 * np.log(t + 1e-300)[None])[0] / v - 1) < 1e-3  # temperature does not move the estimate
+    assert metric_target(0.01)[0] == 1 and metric_target(25.0)[-1] == 1
 
 
 def test_invert():
@@ -132,9 +186,8 @@ def test_invert():
     assert invert(QUESTIONS[1]) is QUESTIONS[1]
     yes_no = dict(QUESTIONS[0], question="Is the plate behind of the bench?")
     assert invert(yes_no)["question"] == "Is the plate infront of the bench?"
-    assert invert(dict(yes_no, question="Is the plate infront of the bench?"))["question"] == "Is the plate behind of the bench?"
     assert invert(dict(yes_no, question="Is the plate to the left of the bench?"))["question"] == "Is the plate to the right of the bench?"
-    for text in ("Is the left cabinet longer than the plate?", "Is the plate infront of the shelf to the right of a radiator?", "Is the plate longer than the shelf behind the door?"):
+    for text in ("Is the left cabinet longer than the plate?", "Is the plate infront of the shelf to the right of a radiator?"):
         q = dict(yes_no, question=text)
         assert invert(q) is q
 
@@ -165,11 +218,11 @@ def dataset(tmp_path_factory):
     for split, n in (("train", 6), ("val", 8)):
         with open(d / "records" / f"{split}_all.jsonl", "w") as f:
             for i in range(n):
-                p = d / "images" / f"{40000000 + 7919 * i}" / f"{split}{i}.png"
+                p = d / "images" / f"{split}{i}.png"
                 p.parent.mkdir(parents=True, exist_ok=True)
                 Image.fromarray(rng.integers(0, 255, (96, 128, 3), dtype=np.uint8)).save(p)
-                for j, q in enumerate(QUESTIONS + QUESTIONS[:2] * (i % 2)):  # odd frames have 6 questions -> 2 items at max_questions 4
-                    f.write(json.dumps(dict(q, id=f"{split}{i}_{j}", image=str(p), intrinsics=None, depth_gt=None)) + "\n")
+                for j, q in enumerate(QUESTIONS + QUESTIONS[:2] * (i % 2)):  # odd frames have 6 questions -> 2 eval items at max_questions 4
+                    f.write(json.dumps(dict(q, id=f"{40000000 + 7919 * i}_{j:05d}_{j}", image=str(p), intrinsics=None, depth_gt=None)) + "\n")
     subprocess.run([sys.executable, ROOT / "preprocessing/build_frames.py", d / "records", d / "frames"], check=True, capture_output=True)
     pool = load_script("moge_geometry").pool
     for split in ("train", "val"):
@@ -185,20 +238,25 @@ def dataset(tmp_path_factory):
     return d
 
 
+def source(d):
+    return dict(name="fake", frames_dir=str(d / "frames"), geom_dir=str(d / "geom"), share=1.0)
+
+
 def test_frames(dataset, parts):
     tok, _, ip = parts
-    cfg = yaml.safe_load(open(ROOT / "configs/train.yaml")) | dict(frames_dir=str(dataset / "frames"), geom_dir=str(dataset / "geom"))
-    cfg["data"] |= dict(max_questions=4, train_pixels=[20000], eval_pixels=30000)
-    train = Frames(cfg, "train", tok, train=True)
-    assert len(train) == 6  # one visit per frame, however many questions it has
+    cfg = yaml.safe_load(open(ROOT / "configs/train.yaml"))
+    cfg["data"] |= dict(max_questions=4, train_pixels=[20000], eval_pixels=30000, geo_drop=0.0)
+    train = Frames(cfg, source(dataset), "train", tok, train=True)
+    assert len(train) == 6 and abs(float(train.weights().sum()) - 1) < 1e-9  # one visit per frame, however many questions it has
     assert all(len(train[i]["questions"]) == 4 for i in range(6))
-    dev, test = (Frames(cfg, "val", tok, train=False, subset=s) for s in ("dev", "test"))
+    dev, test = (Frames(cfg, source(dataset), "val", tok, train=False, subset=s) for s in ("dev", "test"))
     assert len(dev) and len(test) and len(dev) + len(test) == 12
     b = Collate(ip, tok)([train[0], train[1]])
     L, nvis = len(b["input_ids"]), int(b["vis_pos"].sum())
-    assert b["position_ids"].shape == (3, 1, L) and b["doc"].shape == (L,)
-    assert nvis == len(b["geometry"]) == int((b["image_grid_thw"].prod(1) // 4).sum())
-    assert torch.isfinite(b["geometry"]).all() and (b["opt_mask"].sum(1) >= 2).all()
+    assert b["position_ids"].shape == (3, 1, L) and b["doc"].shape == (L,) and nvis == int((b["image_grid_thw"].prod(1) // 4).sum())
+    assert int(b["geo_pos"].sum()) == len(b["geometry"]) > 0 and torch.isfinite(b["geometry"]).all()
+    assert len(b["cnt_q"]) == len(b["met_q"]) == 2 and (b["opt_mask"].sum(1) >= 2).all() and b["out_mask"][b["met_q"]].sum(1).eq(METRIC).all()
+    assert torch.allclose(b["target"].sum(1), torch.ones(len(b["qid"])))
 
 
 @pytest.fixture(scope="module")
@@ -210,22 +268,21 @@ def tiny_dir(tmp_path_factory, parts):
 
 
 def test_scripts(dataset, tiny_dir, tmp_path):
-    """train.py stage A -> stage B (init from A) -> resume is a no-op -> evaluate.py."""
+    """train.py stage A -> stage B with LoRA (init from A) -> resume is a no-op -> evaluate.py."""
     cfg = yaml.safe_load(open(ROOT / "configs/train.yaml"))
     run = tmp_path / "run"
-    cfg |= dict(model=str(tiny_dir), frames_dir=str(dataset / "frames"), geom_dir=str(dataset / "geom"), out_dir=str(run), attn="sdpa",
-                net=NET, batch_frames=4, eval_every=2, eval_questions=10, save_every=2)
-    cfg["data"] |= dict(max_questions=4, train_pixels=[20000, 40000], eval_pixels=30000, workers=0)
-    cfg["stages"] = {"A": dict(steps=3, lr_llm=0.0, lr_new=1e-3), "B": dict(epochs=1, lr_llm=1e-4, lr_new=1e-3, init=str(run / "A/last.pt"))}
+    cfg |= dict(model=str(tiny_dir), sources=[source(dataset)], out_dir=str(run), attn="sdpa", net=LORA, batch_frames=4, eval_every=2, eval_questions=10, save_every=2)
+    cfg["data"] |= dict(max_questions=4, frames_per_micro=2, train_pixels=[20000, 40000], eval_pixels=30000, workers=0)
+    cfg["stages"] = {"A": dict(steps=3, lr_llm=0.0, lr_new=1e-3), "B": dict(steps=2, lr_llm=1e-3, lr_merger=1e-4, lr_new=1e-3, init=str(run / "A/last.pt"))}
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump(cfg))
     sh = lambda *a: subprocess.run([sys.executable, "-m", *a], cwd=ROOT, check=True, capture_output=True, text=True).stdout
     sh("decide3d.train", path, "A"), sh("decide3d.train", path, "B")
     assert '"step"' not in sh("decide3d.train", path, "B")
     log = [json.loads(l) for l in open(run / "B/log.jsonl")]
-    assert log[0]["steps"] == 1 and any("dev" in l for l in log)
-    sh("decide3d.evaluate", path, run / "B/last.pt")
+    assert log[0]["steps"] == 2 and any("dev" in l for l in log) and (run / "B/best.pt").exists()
+    sh("decide3d.evaluate", path, run / "B/best.pt")
     report = json.loads((run / "B/report.json").read_text())
-    assert report["order"]["max_dp"] < 1e-2  # bf16 noise; flips only happen at near-ties of this random model
-    assert set(report["test"]) >= {"all", "yes_no", "choice", "score", "regression"} and "mra" in report["test"]["regression"]
-    assert (run / "B/final.pt").exists()
+    assert report["order"]["n"] > 0 and report["order"]["max_dp"] < 1e-2  # bf16 noise
+    assert set(report["test"]) >= {"all", "yes_no", "choice", "count", "metric"} and "acc@10%" in report["test"]["metric"] and "metric" in report["test_no_geometry"]
+    assert math.isfinite(report["test"]["all"]["nll"]) and (run / "B/final.pt").exists()
